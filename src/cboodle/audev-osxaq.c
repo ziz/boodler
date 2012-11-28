@@ -26,6 +26,9 @@
 #define NUM_BUFFERS (3)
 #define SIZE_BUFFERS (32768)
 
+#define LEN_DEVICE_NAME (128)
+#define LEN_DEVICE_LIST (16)
+
 static int sound_big_endian = 0;
 static long sound_rate = 0; /* frames per second */
 static int sound_channels = 0;
@@ -46,6 +49,11 @@ typedef struct buffer_struct {
   int full;
 } buffer_t;
 
+typedef struct airplay_source_struct {
+    char name[LEN_DEVICE_NAME];
+    UInt32 id;
+} airplay_source;
+
 static AudioQueueRef aqueue = NULL;
 static buffer_t *buffers = NULL; /* array, len bufcount */
 
@@ -64,8 +72,11 @@ int audev_init_device(char *wantdevname, long ratewanted, int verbose, extraopt_
   int listdevices = FALSE;
   AudioDeviceID wantdevid;
   AudioDeviceID wantedaudev;
-#define LEN_DEVICE_NAME 128
+  AudioDeviceID wantedsourceid;
+  AudioDeviceID foundsourceid = NULL;
+
   char devicename[LEN_DEVICE_NAME];
+  char sourcename[LEN_DEVICE_NAME] = "";
   CFStringRef deviceuid = NULL;
   extraopt_t *opt;
   char endtest[sizeof(unsigned int)];
@@ -112,6 +123,9 @@ int audev_init_device(char *wantdevname, long ratewanted, int verbose, extraopt_
     else if (!strcmp(opt->key, "listdevices")) {
       listdevices = TRUE;
     }
+    else if (!strcmp(opt->key, "source") && opt->val) {
+	strncpy(sourcename, opt->val, LEN_DEVICE_NAME);
+    }
   }
 
   if (bufcount < 2)
@@ -127,14 +141,27 @@ int audev_init_device(char *wantdevname, long ratewanted, int verbose, extraopt_
     wantdevid = strtol(wantdevname, &endptr, 10);
     if (!endptr || endptr == wantdevname || (*endptr != '\0'))
       wantdevid = kAudioDeviceUnknown;
+
+  }
+
+  if (sourcename) {
+    char *endptr = NULL;
+    wantedsourceid = strtol(sourcename, &endptr, 10);
+    if (!endptr || endptr == sourcename || (*endptr != '\0'))
+	wantedsourceid = NULL;
   }
 
   if (listdevices || wantdevname) {
     int ix, jx;
     int device_count;
     UInt32 propsize;
-#define LEN_DEVICE_LIST 16
+    airplay_source *airplay_sources = NULL;
     AudioDeviceID devicelist[LEN_DEVICE_LIST];  
+
+    int source_count;
+    unsigned int transportType = 0;
+    UInt32 fetchpropsize = sizeof(transportType);
+    AudioObjectPropertyAddress addr;
 
     propsize = LEN_DEVICE_LIST * sizeof(AudioDeviceID);
     status = AudioHardwareGetProperty(kAudioHardwarePropertyDevices,
@@ -146,6 +173,7 @@ int audev_init_device(char *wantdevname, long ratewanted, int verbose, extraopt_
     device_count = propsize / sizeof(AudioDeviceID);
 
     for (ix=0; ix<device_count; ix++) {
+      
       AudioDeviceID tmpaudev = devicelist[ix];
 
       /* Determine if this is an output device. */
@@ -190,8 +218,65 @@ int audev_init_device(char *wantdevname, long ratewanted, int verbose, extraopt_
 	return FALSE;
       }
 
-      if (listdevices)
+      addr.mSelector = kAudioDevicePropertyTransportType;
+      addr.mScope = kAudioObjectPropertyScopeGlobal;
+      addr.mElement = kAudioObjectPropertyElementMaster;
+      AudioObjectGetPropertyData(tmpaudev, &addr, 0, NULL, &fetchpropsize, &transportType);
+
+      if (kAudioDeviceTransportTypeAirPlay == transportType) {
+	  UInt32 *airplay_source_ids;
+	  addr.mSelector = kAudioDevicePropertyDataSources;
+	  addr.mScope = kAudioDevicePropertyScopeOutput;
+	  addr.mElement = kAudioObjectPropertyElementMaster;
+	  AudioObjectGetPropertyDataSize(tmpaudev, &addr, 0, NULL, &fetchpropsize);
+	  airplay_source_ids = malloc(fetchpropsize);
+	  source_count = fetchpropsize / sizeof(UInt32);
+	  airplay_sources = malloc(source_count * sizeof(airplay_source));
+
+	  AudioObjectGetPropertyData(tmpaudev, &addr, 0, NULL, &fetchpropsize, airplay_source_ids);
+	  for (int sid=0; sid < source_count; sid++) {
+	      airplay_sources[sid].id = NULL;
+	      int _sourceID = airplay_source_ids[sid];
+	      addr.mSelector = kAudioDevicePropertyDataSourceNameForIDCFString;
+	      addr.mScope = kAudioObjectPropertyScopeOutput;
+	      addr.mElement = kAudioObjectPropertyElementMaster;
+		
+	      CFStringRef value = NULL;
+
+	      AudioValueTranslation audioValueTranslation;
+	      audioValueTranslation.mInputDataSize = sizeof(UInt32);
+	      audioValueTranslation.mOutputData = (void *) &value;
+	      audioValueTranslation.mOutputDataSize = sizeof(CFStringRef);
+	      audioValueTranslation.mInputData = (void *) &_sourceID;
+
+	      fetchpropsize = sizeof(AudioValueTranslation);
+	      AudioObjectGetPropertyData(tmpaudev, &addr, 0, NULL, &fetchpropsize, &audioValueTranslation);
+	      if (value) {
+		  CFDataRef data;
+		  data = CFStringCreateExternalRepresentation(NULL, value, kCFStringEncodingMacRoman, '?');
+		  if (data) {
+		      airplay_sources[sid].id = _sourceID;
+		      strncpy(airplay_sources[sid].name, CFDataGetBytePtr(data), LEN_DEVICE_NAME);
+		      CFRelease(data);
+		  }
+		  CFRelease(value);
+	      }
+	  }
+	  free(airplay_source_ids);
+      }
+
+      if (listdevices) {
 	printf("Found device ID %d: \"%s\".\n", (int)tmpaudev, devicename);
+	if (kAudioDeviceTransportTypeAirPlay == transportType) {
+	    //printf("Hey, an airplay.  Looks like %d sources...\n", source_count);
+	  for (int sid=0; sid < source_count; sid++) {
+	      airplay_source source = airplay_sources[sid];
+	      if (source.id) {
+		  printf("  - airplay source ID %d: -D source=\"%s\"\n", source.id, source.name);
+	      }
+	  }
+	}
+      }
 
       /* Check if the desired name matches (a prefix of) the device name. */
       if (wantdevname && !strncmp(wantdevname, devicename, 
@@ -202,6 +287,53 @@ int audev_init_device(char *wantdevname, long ratewanted, int verbose, extraopt_
       /* Check if the int version of the desired name matches the device ID. */
       if (wantdevid != kAudioDeviceUnknown && wantdevid == tmpaudev) {
 	wantedaudev = tmpaudev;
+      }
+      if (wantedaudev == tmpaudev && kAudioDeviceTransportTypeAirPlay == transportType) {
+	  if (sourcename && strnlen(sourcename, LEN_DEVICE_NAME) > 0) {
+	      for (int sid=0; sid < source_count; sid++) {
+		  if (airplay_sources[sid].id == NULL)
+		      continue;
+		  if (wantedsourceid == airplay_sources[sid].id) {
+		      foundsourceid = airplay_sources[sid].id;
+		      strncpy(sourcename, airplay_sources[sid].name, LEN_DEVICE_NAME);
+		      break;
+		  }
+		  if (!strncasecmp(sourcename, airplay_sources[sid].name, strlen(sourcename))) {
+		      foundsourceid = airplay_sources[sid].id;
+		      strncpy(sourcename, airplay_sources[sid].name, LEN_DEVICE_NAME);
+		      break;
+		  }
+	      }
+	      if (foundsourceid == NULL) {
+		  fprintf(stderr, "Could not locate requested source: %s\n", sourcename);
+		  return FALSE;
+	      }
+	  }
+	  else {
+	      UInt32 source_size = source_count * sizeof(UInt32);
+	      UInt32 *sourceIds = malloc(source_size);
+	      if (verbose)
+		  printf("Sending to every source...");
+	      for (int sid=0; sid < source_count; sid++) {
+		  sourceIds[sid] = airplay_sources[sid].id;
+		  if (verbose)
+		      printf("%s...", airplay_sources[sid].name);
+	      }
+	      printf("\n");
+	      
+	      AudioObjectPropertyAddress addr;
+	      addr.mSelector = kAudioDevicePropertyDataSource;
+	      addr.mScope = kAudioDevicePropertyScopeOutput;
+	      addr.mElement = kAudioObjectPropertyElementMaster;
+        
+	      AudioObjectSetPropertyData(wantedaudev, &addr, 0, NULL, source_size, sourceIds);
+	      free(sourceIds);
+	  }
+      }
+
+      if (airplay_sources != NULL) {
+	  free(airplay_sources);
+	  airplay_sources = NULL;
       }
     }
   }
@@ -238,6 +370,19 @@ int audev_init_device(char *wantdevname, long ratewanted, int verbose, extraopt_
         return FALSE;
       }
       printf("Got device ID %d: \"%s\".\n", (int)wantedaudev, devicename);
+
+    }
+    if (foundsourceid != NULL) {
+	AudioObjectPropertyAddress addr;
+
+	addr.mSelector = kAudioDevicePropertyDataSource;
+	addr.mScope = kAudioDevicePropertyScopeOutput;
+	addr.mElement = kAudioObjectPropertyElementMaster;
+	
+	AudioObjectSetPropertyData(wantedaudev, &addr, 0, NULL, sizeof(UInt32), &foundsourceid);
+	if (verbose) {
+	    printf("Got source ID %d: \"%s\".\n", foundsourceid, sourcename);
+	}
     }
   }
 
